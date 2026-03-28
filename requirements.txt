@@ -1,1 +1,12 @@
 streamlit
+pandas
+openpyxl
+geopandas
+folium
+streamlit-folium
+requests
+numpy
+scipy
+scikit-image
+shapely
+pyogrio
