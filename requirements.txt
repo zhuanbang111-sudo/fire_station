@@ -10,3 +10,4 @@ scipy
 scikit-image
 shapely
 pyogrio
+pytz
