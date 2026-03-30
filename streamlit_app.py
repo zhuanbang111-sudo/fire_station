@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 消防站点 5 分钟等时圈分析工具 v2.0
-优化项：增加时间戳，增加坐标系选择功能、非道路距离惩罚、消防特权建模、双策略路径采样、车辆掉头特权系数
+优化项：增加时间戳，增加坐标系选择功能、非道路距离惩罚、消防特权建模、双策略路径采样、车辆掉头特权系数、国内优化的WGS84图层
 """
 # ==============================================================================
 # 第一部分：导入系统所需的“核心工具组件”
@@ -160,7 +160,7 @@ def run_cost_surface_engine(api_keys, key_idx, origin_lng, origin_lat, target_mi
     trail_points = []
 
     # --- 核心优化 3：最优出口匹配 + 消防特权建模 ---
-    url_route = "https://restapi.amap.com/v3/direction/driving"  #高德地图API，路径规划
+    url_route = "https://restapi.amap.com/v3/direction/driving"  # 高德地图API，路径规划
 
     # 新增：双策略轮询池 (13:速度优先-避堵走大路, 17:距离优先-抄近道穿小巷)
     strategies = [13, 17]
@@ -172,7 +172,6 @@ def run_cost_surface_engine(api_keys, key_idx, origin_lng, origin_lat, target_mi
         # 新增：双策略交替采样
         current_strategy = strategies[i % len(strategies)]
 
-        # 替换原有的固定 strategy: 13
         params = {"origin": f"{best_o['lng']:.6f},{best_o['lat']:.6f}", "destination": dest,
                   "strategy": current_strategy,
                   "key": api_keys[key_idx]}
@@ -186,7 +185,6 @@ def run_cost_surface_engine(api_keys, key_idx, origin_lng, origin_lat, target_mi
                 dur = int(s['duration'])
 
                 # 新增：消防特权掉头代价折减
-                # 如果导航动作包含掉头，将其耗时强行削减（如保留15%的时间）
                 instruction = s.get('instruction', '')
                 action = s.get('action', '')
                 if '掉头' in instruction or action == '掉头':
@@ -195,7 +193,6 @@ def run_cost_surface_engine(api_keys, key_idx, origin_lng, origin_lat, target_mi
                 polyline = s['polyline'].split(';')
                 t_step = dur / max(1, len(polyline) - 1)
 
-                # 修复一个小细节：将内部循环变量改为 j，防止覆盖外部的 enumerate(anchors) 的 i
                 for j, p in enumerate(polyline):
                     plng, plat = map(float, p.split(','))
                     w_lng, w_lat = gcj02_to_wgs84(plng, plat)
@@ -210,12 +207,6 @@ def run_cost_surface_engine(api_keys, key_idx, origin_lng, origin_lat, target_mi
 # 第五部分：空间时间场算法 (重构版：引入步行截断 + 距离惩罚函数)
 # ==============================================================================
 def create_isoline_polygon(trail_points, target_sec, off_road_speed, max_walk_dist=300):
-    """
-    逻辑说明：
-    1. 物理距离换算：计算每个地块中心点离最近马路的真实米数。
-    2. 距离惩罚函数：离马路越远，步速受到指数级阻力，收缩假性覆盖面积。
-    3. 深度截断：如果离马路超过 max_walk_dist (默认300米)，判定为不可达。
-    """
     if len(trail_points) < 10: return None
 
     # 1. 整理数据并进行地球曲率缩放
@@ -247,19 +238,13 @@ def create_isoline_polygon(trail_points, target_sec, off_road_speed, max_walk_di
     physical_meters = dists * 111320
 
     # --- 新增：距离惩罚函数 (Distance Penalty Function) ---
-    # 基础理想步行时间
     base_walk_time = physical_meters / off_road_speed
-
-    # 惩罚建模：假设前100米属于临街/正常深入范畴，阻力正常。
-    # 超过100米后，受建筑、围墙、绿化阻挡，阻力呈平方级剧增。
-    # 矩阵运算保证性能，不使用慢速的 for 循环。
     penalty_factor = 1.0 + np.maximum(0, physical_meters - 100) / 60.0
     actual_off_road_time = base_walk_time * (penalty_factor ** 2)
 
-    # 总时间 = 开车到路边的时间 + 开车进入地块的时间
     grid_t = times[indices] + actual_off_road_time
-    # --- 核心优化：距离截断逻辑 (维持原逻辑，作为双重保险) ---
     grid_t[physical_meters > max_walk_dist] = target_sec * 5
+
     # 5. 提取边界线并生成多边形
     grid_t = grid_t.reshape((grid_res, grid_res))
     contours = measure.find_contours(grid_t, level=target_sec)
@@ -269,15 +254,18 @@ def create_isoline_polygon(trail_points, target_sec, off_road_speed, max_walk_di
         c_lat = min_y + (c[:, 0] / (grid_res - 1)) * (max_y - min_y)
         if len(c_lng) >= 3: polys.append(Polygon(np.column_stack([c_lng, c_lat])))
 
-    # 合并多边形，修复细小缝隙
     return unary_union(polys).buffer(0.0001).buffer(-0.0001) if polys else None
+
+
 # ==============================================================================
 # 第六部分：网页 UI 布局
 # ==============================================================================
 st.set_page_config(page_title="", layout="wide")
-st.markdown("<h1 style='text-align: center; color: #E74C3C;'>🚒 城市消防站可达性评估系统 v2.0</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center; color: #E74C3C;'>🚒 城市消防站可达性评估系统 v2.0</h1>",
+            unsafe_allow_html=True)
 st.markdown(
-    "<p style='text-align: center; color: #7F8C8D;'>支持多源坐标纠偏 (高德/百度) | 实时路况模拟 | GIS 成果导出(WGS84坐标)" "本版本优化项：调整时间戳为北京时间，增加坐标系选择功能、非道路距离惩罚、消防特权建模、双策略路径采样、车辆掉头特权系数</p>",
+    "<p style='text-align: center; color: #7F8C8D;'>支持多源坐标纠偏 (高德/百度) | 实时路况模拟 | GIS 成果导出(WGS84坐标)<br>"
+    "本版本优化项：调整时间戳为北京时间，增加坐标系选择功能、非道路距离惩罚、消防特权建模、双策略路径采样、国内急速WGS84底图</p>",
     unsafe_allow_html=True)
 st.divider()
 
@@ -290,7 +278,6 @@ st.sidebar.header("⚙️ 核心参数配置")
 api_keys_input = st.sidebar.text_area("1. 输入高德地图 API Keys (多 Key 逗号分隔)")
 api_key_list = [k.strip() for k in api_keys_input.split(',') if k.strip()]
 excel = st.sidebar.file_uploader("2. 上传消防站表格 (station_name, lng, lat)", type=["xlsx"])
-# 🌟 新增坐标系选择按钮
 coord_system = st.sidebar.radio(
     "3. 请选择上传数据的坐标系",
     ("高德坐标 (GCJ-02)", "百度坐标 (BD-09)"),
@@ -299,7 +286,38 @@ coord_system = st.sidebar.radio(
 t_limit = st.sidebar.slider("4. 到场时间要求 (分钟)", 3, 15, 5)
 factor = st.sidebar.slider("5. 消防车特权通行系数", 0.7, 1.0, 0.8)
 walk_speed = st.sidebar.slider("6. 小区内部消防车速度 (m/s)", 1.0, 5.0, 4.0, 0.1)
-map_style = st.sidebar.selectbox("7. 地图风格", ("CartoDB positron", "OpenStreetMap", "CartoDB dark_matter"))
+
+# 🌟 核心修改点：构建国内可用且完全对齐 WGS-84 的高质量底图库
+map_tiles_config = {
+    "智图 GeoQ 彩色版 (国内极速)": {
+        "tiles": "http://map.geoq.cn/ArcGIS/rest/services/ChinaOnlineCommunity/MapServer/tile/{z}/{y}/{x}",
+        "attr": "GeoQ"
+    },
+    "智图 GeoQ 蓝黑版 (国内极速)": {
+        "tiles": "http://map.geoq.cn/ArcGIS/rest/services/ChinaOnlineStreetPurplishBlue/MapServer/tile/{z}/{y}/{x}",
+        "attr": "GeoQ"
+    },
+    "智图 GeoQ 灰色版 (国内极速)": {
+        "tiles": "http://map.geoq.cn/ArcGIS/rest/services/ChinaOnlineStreetGray/MapServer/tile/{z}/{y}/{x}",
+        "attr": "GeoQ"
+    },
+    "Esri 世界街道图 (稳定)": {
+        "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        "attr": "Esri"
+    },
+    "Esri 卫星影像图 (稳定)": {
+        "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "attr": "Esri"
+    },
+    "OpenStreetMap (默认)": {
+        "tiles": "OpenStreetMap",
+        "attr": None
+    }
+}
+# 修改原有的 selectbox
+map_style_key = st.sidebar.selectbox("7. 地图风格 (完美适配WGS84结果)", list(map_tiles_config.keys()))
+map_style_tiles = map_tiles_config[map_style_key]["tiles"]
+map_style_attr = map_tiles_config[map_style_key]["attr"]
 
 record_timestamp = st.sidebar.checkbox("8. 📌 自动记录路况时段标签", value=True)
 
@@ -314,7 +332,7 @@ with col_monitor:
     log_box = st.container(height=250, border=True)
     st.divider()
     st.subheader("📈 数据统计")
-    stats_table_area = st.empty()  # 预留一个空位，等下用来展示最终的成绩单(数据表)
+    stats_table_area = st.empty()
 
 
 def add_log(msg):
@@ -346,12 +364,11 @@ if st.sidebar.button("🚀 开始分析"):
 
         for i, row in df.iterrows():
             name = row['station_name']
-            prog_bar.progress((i + 1) / len(df))  # 推进绿色的进度条
+            prog_bar.progress((i + 1) / len(df))
             raw_lng, raw_lat = row['lng'], row['lat']
             prog_bar.progress((i + 1) / len(df))
             prog_txt.write(f"正在分析站点: {name} ({i + 1}/{len(df)})")
 
-            # 🌟 坐标前置转换：喂给高德 API 的必须是 GCJ-02
             if coord_system == "百度坐标 (BD-09)":
                 api_lng, api_lat = bd09_to_gcj02(raw_lng, raw_lat)
             else:
@@ -366,7 +383,6 @@ if st.sidebar.button("🚀 开始分析"):
 
             poly = create_isoline_polygon(pts, (t_limit * 60 / factor), walk_speed)
             if poly:
-                # 🌟 统一转换为 WGS-84 用于最终展示
                 w_lng, w_lat = gcj02_to_wgs84(api_lng, api_lat)
                 gdf = gpd.GeoDataFrame({
                     '站点名称': [name], 'API消耗': [a_cnt], 'POI锚点数': [p_cnt], '测算时刻': [current_time_tag]
@@ -381,7 +397,7 @@ if st.sidebar.button("🚀 开始分析"):
                 add_log(f"❌ {name} 失败！路网密度不足。")
             if st.session_state.iso_results:
                 live_df = pd.concat(st.session_state.iso_results, ignore_index=True)
-                stats_table_area.dataframe(live_df[['站点名称', '覆盖面积(km²)', 'API消耗','POI锚点数', '测算时刻']],
+                stats_table_area.dataframe(live_df[['站点名称', '覆盖面积(km²)', 'API消耗', 'POI锚点数', '测算时刻']],
                                            height=400, width='stretch')
 
         st.session_state.map_renders += 1
@@ -389,7 +405,13 @@ if st.sidebar.button("🚀 开始分析"):
 
 with col_map:
     m_key = f"fire_map_{st.session_state.map_renders}"
-    m = folium.Map(location=[22.54, 114.05], zoom_start=12, tiles=map_style)
+
+    # 🌟 核心修改点：支持自定义图层和归属权信息
+    if map_style_attr:
+        m = folium.Map(location=[22.54, 114.05], zoom_start=12, tiles=map_style_tiles, attr=map_style_attr)
+    else:
+        m = folium.Map(location=[22.54, 114.05], zoom_start=12, tiles=map_style_tiles)
+
     if st.session_state.iso_results:
         m.location = [st.session_state.iso_results[0]['lat'].iloc[0], st.session_state.iso_results[0]['lng'].iloc[0]]
         for res in st.session_state.iso_results:
@@ -403,50 +425,37 @@ if st.session_state.iso_results:
     st.divider()
     st.subheader("💾 成果导出")
     full_gdf = gpd.GeoDataFrame(pd.concat(st.session_state.iso_results, ignore_index=True), crs="EPSG:4326")
-    # ==============================================================================
-    # 🌟 在这里插入【数据清洗】
-    # 目的 A：解决 Arrow 序列化警告。将非几何列统一转为标准类型，防止混合类型。
+
     for col in full_gdf.columns:
         if col != 'geometry':
-            # 将 object 类型（混合类型）强制转为字符串，确保前端展示不报错
             if full_gdf[col].dtype == object:
                 full_gdf[col] = full_gdf[col].astype(str)
-    # 目的 B：防御性补全。确保刚才报错的“POI点数”等关键列如果缺失则补0
-    required_cols = ['站点名称', '覆盖面积(km²)', 'API消耗', 'POI点数', '测算时刻','geometry']
+
+    required_cols = ['站点名称', '覆盖面积(km²)', 'API消耗', 'POI点数', '测算时刻', 'geometry']
     for c in required_cols:
         if c not in full_gdf.columns:
             full_gdf[c] = 0
-    # ==============================================================================
+
     d_col1, d_col2 = st.columns(2)
     with d_col1:
         csv_bin = full_gdf.drop(columns='geometry').to_csv(index=False).encode('utf-8-sig')
         st.download_button("📊 导出统计报表 (CSV)", data=csv_bin, file_name="分析.csv", width='stretch')
-    with d_col2:  # 专业 GIS 规划师用的 Shapefile 打包下载
-        zip_mem = BytesIO()  # 虚拟一个内存空间，速度比写在硬盘上快一万倍
-        with tempfile.TemporaryDirectory() as tmp_d:  # 召唤一个隐形的临时文件夹
+    with d_col2:
+        zip_mem = BytesIO()
+        with tempfile.TemporaryDirectory() as tmp_d:
             shp_path = os.path.join(tmp_d, "fire_result.shp")
-            # 🌟 避坑指南：Shapefile 的古老规矩，每一列的名字不能超过 10 个英文字符！
-            # 如果不把中文改成短英文，程序打包时会当场崩溃给你看。
-            # 1. 确保筛选时包含了所有 6 个字段
-            exp_gdf = full_gdf[['站点名称', '覆盖面积(km²)', 'API消耗', 'POI锚点数', '测算时刻','geometry']].copy()
-            # 2. 确保改名列表也是 6 个（顺序必须严格对应）
-            # 原名: ['站点名称', '覆盖面积(km²)', 'API消耗', 'POI点数', '测算时刻', 'geometry']
-            exp_gdf.columns = ['Name', 'Area_km2', 'API_Cnt', 'POI_Cnt', 'Time_Tag','geometry']
-            # 存入那个隐形的文件夹里，自动生成 .shp, .dbf, .shx, .prj 四个兄弟文件
+            exp_gdf = full_gdf[['站点名称', '覆盖面积(km²)', 'API消耗', 'POI锚点数', '测算时刻', 'geometry']].copy()
+            exp_gdf.columns = ['Name', 'Area_km2', 'API_Cnt', 'POI_Cnt', 'Time_Tag', 'geometry']
             exp_gdf.to_file(shp_path, driver='ESRI Shapefile', encoding='utf-8')
 
-            # 拿出打包器，把这四个兄弟全部塞进 ZIP 压缩包里
             with zipfile.ZipFile(zip_mem, "w", zipfile.ZIP_DEFLATED) as zf:
                 for r, _, fs in os.walk(tmp_d):
                     for f in fs: zf.write(os.path.join(r, f), arcname=f)
 
-        # 提供一个华丽的下载按钮，一键把压缩包交到用户手上
-        st.download_button("📦 2. 导出专业地图图层...", data=zip_mem.getvalue(), file_name="图层（wgs84）.zip", width='stretch')
-# ==============================================================================
-# 第九部分：生成的表格可视化与导出逻辑 (保持稳定)
-# ==============================================================================
+        st.download_button("📦 2. 导出专业地图图层...", data=zip_mem.getvalue(), file_name="图层（wgs84）.zip",
+                           width='stretch')
+
 with col_monitor:
-    # 只要成绩箱里有东西，不管你在左边地图怎么乱点，右边这个表始终死死钉在墙上给你看
     if st.session_state.iso_results:
         summary_all_df = pd.concat(st.session_state.iso_results, ignore_index=True)
         stats_table_area.dataframe(
