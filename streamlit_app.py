@@ -410,6 +410,6 @@ with col_monitor:
         summary_all_df = pd.concat(st.session_state.iso_results, ignore_index=True)
         stats_table_area.dataframe(
             summary_all_df[['站点名称', '覆盖面积(km²)', 'API消耗', 'POI锚点数', '测算时刻']],
-            height=450,
+            height=300,
             width='stretch'
         )
